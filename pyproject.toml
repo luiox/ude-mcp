@@ -1,0 +1,23 @@
+[project]
+name = "ude-mcp"
+version = "0.0.1"
+description = "MCP server for the PLS UDE (Universal Debug Engine) debugger"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "luiox" }]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0,<2",
+    "pywin32>=306",
+    "comtypes>=1.4",
+]
+
+[project.scripts]
+ude-mcp = "ude_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ude_mcp"]
