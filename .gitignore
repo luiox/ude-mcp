@@ -19,3 +19,6 @@ Thumbs.db
 
 # local experiments (never commit machine-specific captures)
 scratch/
+
+# machine-specific DAS helper (hardcoded install paths)
+start_das_stack.ps1

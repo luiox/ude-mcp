@@ -14,7 +14,9 @@ _ASSETS = Path(__file__).parent / "assets"
 
 # UDE executable discovery: set UDE_MCP_UDE_EXE, or add your install path here,
 # e.g. r"<UDE_INSTALL_DIR>\UDEVisualPlatform.exe"
-_UDE_EXE_CANDIDATES: list[str] = []
+_UDE_EXE_CANDIDATES: list[str] = [
+    r"C:\Program Files\pls\UDE Starterkit 2021\UDEVisualPlatform.exe",
+]
 
 
 def find_ude_exe() -> str:
@@ -46,11 +48,13 @@ class UdeSession:
         wsx: str | None = None,
         cfg: str | None = None,
         timeout: float = 90.0,
+        exe: str | None = None,
     ) -> dict:
         """Launch UDE with the bridge agent.
 
         Either pass ``cfg`` (a target configuration file) to create a fresh
         workspace, or ``wsx`` (an existing workspace file) to load it.
+        ``exe`` overrides UDE executable discovery.
         """
         if self.proc is not None:
             raise RuntimeError("session already running; call stop() first")
@@ -66,8 +70,7 @@ class UdeSession:
         self._bridge_js = self._workdir / "ude_bridge.js"
         self._bridge_js.write_text(js, encoding="utf-8")
 
-        exe = find_ude_exe()
-        self.proc = subprocess.Popen([exe, f"-s{self._bridge_js}"])
+        self.proc = subprocess.Popen([(exe or find_ude_exe()), f"-s{self._bridge_js}"])
 
         if not self.bridge.wait_for_agent(timeout):
             self.stop()

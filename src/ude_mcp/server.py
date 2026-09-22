@@ -1,8 +1,10 @@
-"""ude-mcp MCP tools.
+"""ude-mcp MCP tools — thin wrappers over ude_mcp.core.Ude.
 
 Session model: one UDE instance per MCP server. Start it with
 ``ude_session_start`` (TSIM preset for hardware-free testing), then drive
-the debugger through the other tools.
+the debugger through the other tools. Reliability rituals (connect retry,
+flash retry, post-flash reset cycles, leaked-instance cleanup) live in
+core.py and are shared with the CLI.
 """
 
 from __future__ import annotations
@@ -13,12 +15,14 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .session import UdeSession
+from .config import load_config
+from .core import Ude
+from .errors import UdeError
 
 mcp = FastMCP("ude-mcp")
 
-_session = UdeSession()
-_session_lock = threading.Lock()
+_client: Ude | None = None
+_client_lock = threading.Lock()
 
 _TSIM_CFG_TEXT = """\
 [Main]
@@ -61,14 +65,14 @@ def _tsim_cfg_path() -> str:
     return str(cfg)
 
 
-def _the_session() -> UdeSession:
-    _session.ensure_running()
-    return _session
+def _the_client() -> Ude:
+    if _client is None or _client.session is None:
+        raise UdeError("session", "no live UDE session; call ude_session_start first")
+    return _client
 
 
 def _call(cmd: str, bridge_timeout: float = 45.0, **args):
-    _session.ensure_running()
-    return _session.bridge.call(cmd, bridge_timeout, **args)
+    return _the_client().call(cmd, bridge_timeout, **args)
 
 
 # ---------------------------------------------------------------------------
@@ -77,38 +81,50 @@ def _call(cmd: str, bridge_timeout: float = 45.0, **args):
 
 @mcp.tool()
 def ude_session_start(
-    cfg: str = "", wsx: str = "", tsim: bool = False, timeout: float = 90.0
+    cfg: str = "", wsx: str = "", tsim: bool = False, timeout: float = 240.0,
+    kill_existing: bool = False, connect: bool = True,
 ) -> dict:
-    """Launch a UDE instance with the automation bridge.
+    """Launch a UDE instance with the automation bridge and optionally connect.
 
     Exactly one of:
       - cfg:  path to a UDE target configuration (.cfg) -> a fresh workspace is created
       - wsx:  path to an existing UDE workspace (.wsx) -> it is loaded
       - tsim: true -> use the built-in TriCore simulator (no hardware needed)
+    kill_existing: first kill leaked UDE instances (they hold the DAP).
+    connect: also connect to the target with retries (default true).
     """
-    with _session_lock:
+    global _client
+    with _client_lock:
+        if _client is not None and _client.session is not None:
+            _client.close()
         if tsim:
-            return _session.start(cfg=_tsim_cfg_path(), timeout=timeout)
-        if cfg:
-            return _session.start(cfg=cfg, timeout=timeout)
-        if wsx:
-            return _session.start(wsx=wsx, timeout=timeout)
-        raise ValueError("provide cfg, wsx, or tsim=true")
+            overrides = dict(cfg=_tsim_cfg_path(), wsx="")
+        else:
+            overrides = dict(cfg=cfg, wsx=wsx)
+        # empty-string overrides fall through to conf/env/defaults in load_config
+        resolved = load_config(**overrides)
+        client = Ude(resolved)
+        client.cfg.start_timeout = timeout
+        status = client.open(kill_existing=kill_existing, connect=connect)
+        _client = client
+        return status
 
 
 @mcp.tool()
 def ude_session_stop() -> str:
     """Close the UDE instance."""
-    with _session_lock:
-        _session.stop()
+    global _client
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
     return "stopped"
 
 
 @mcp.tool()
 def ude_status() -> dict:
     """Current UDE version, workspace, and per-core state snapshot."""
-    _the_session()
-    return _call("status")
+    return _the_client().status()
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +132,9 @@ def ude_status() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def ude_connect(timeout: float = 20.0) -> bool:
-    """Connect to the target (starts the TSIM simulator, or talks to real hardware)."""
-    return bool(_call("connect", timeout + 15.0, timeout=timeout))
+def ude_connect(timeout: float = 20.0, retries: int = 3) -> bool:
+    """Connect to the target with retries (DAS connects are flaky)."""
+    return bool(_the_client().connect(retries=retries, per_try=timeout))
 
 
 @mcp.tool()
@@ -134,9 +150,15 @@ def ude_load_program(path: str, core: int = 0) -> bool:
 
 
 @mcp.tool()
-def ude_flash(path: str, core: int = 0, options: str = "") -> bool:
-    """Download and flash a program file. Optional UDE options (e.g. 'VerifyOnly')."""
-    return bool(_call("flash", path=path, core=core, options=options))
+def ude_flash(path: str, core: int = 0, flash_retries: int = 4,
+              resets: int = 3, kill_existing: bool = True) -> dict:
+    """Full flash ritual: halt -> LoadAndFlash (retried) -> reset+go xN -> running.
+
+    The TC3xx needs several reset cycles after flashing or it comes up with
+    weird bugs. Returns a summary (attempts used, final core state).
+    """
+    return _the_client().flash(path, flash_retries=flash_retries, resets=resets,
+                               kill_existing=kill_existing, core=core)
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +168,15 @@ def ude_flash(path: str, core: int = 0, options: str = "") -> bool:
 @mcp.tool()
 def ude_go(core: int = 0) -> bool:
     """Start/resume execution on the core."""
-    return bool(_call("go", core=core))
+    _the_client().go(core)
+    return True
 
 
 @mcp.tool()
 def ude_halt(core: int = 0) -> bool:
     """Halt execution on the core."""
-    return bool(_call("halt", core=core))
+    _the_client().halt(core)
+    return True
 
 
 @mcp.tool()
@@ -167,7 +191,15 @@ def ude_step(direction: str = "into", core: int = 0) -> bool:
 @mcp.tool()
 def ude_reset(core: int = 0) -> bool:
     """Reset the target/core."""
-    return bool(_call("reset", core=core))
+    _the_client().reset(core)
+    return True
+
+
+@mcp.tool()
+def ude_reset_and_run(resets: int = 3, core: int = 0) -> bool:
+    """Reset+go once, then `resets` extra reset+go cycles (TC3xx quirk)."""
+    _the_client().reset_and_run(resets=resets, core=core)
+    return True
 
 
 @mcp.tool()
@@ -221,6 +253,21 @@ def ude_var_write(expr: str, value, core: int = 0) -> bool:
 
 
 @mcp.tool()
+def ude_read_symbol(spec: str, width: int = 0, core: int = 0) -> int:
+    """Read an address ('0xD0000000') or a symbol name from the linker map.
+
+    Symbol width is derived from the map size unless `width` (8|16|32) is given.
+    """
+    return _the_client().read(spec, width=width or None, core=core)
+
+
+@mcp.tool()
+def ude_symbols(pattern: str) -> list:
+    """Search the linker map for symbols matching a regex (offline, no target access)."""
+    return [str(s) for s in _the_client().symbol_table().search(pattern)]
+
+
+@mcp.tool()
 def ude_reg_read(name: str, core: int = 0):
     """Read a CPU register (e.g. 'PC', 'A[10]', 'D[0]')."""
     return _call("reg_read", name=name, core=core)
@@ -233,15 +280,19 @@ def ude_reg_write(name: str, value, core: int = 0) -> bool:
 
 
 @mcp.tool()
-def ude_mem_read(addr, width: int = 32, core: int = 0):
-    """Read one memory cell. addr: hex string ('0xD0000000') or int. width: 8|16|32."""
-    return _call("mem_read", addr=_addr(addr), width=width, core=core)
+def ude_mem_read(addr, width: int = 32, core: int = 0) -> int:
+    """Read one memory cell (raises a tagged error instead of returning junk).
+    addr: hex string ('0xD0000000') or int. width: 8|16|32."""
+    return _the_client().mem_read(int(addr, 0) if isinstance(addr, str) else addr,
+                                  width=width, core=core)
 
 
 @mcp.tool()
 def ude_mem_write(addr, value, width: int = 32, core: int = 0) -> bool:
     """Write one memory cell (addr as in ude_mem_read)."""
-    return bool(_call("mem_write", addr=_addr(addr), value=value, width=width, core=core))
+    _the_client().mem_write(int(addr, 0) if isinstance(addr, str) else addr,
+                            value, width=width, core=core)
+    return True
 
 
 @mcp.tool()
@@ -254,10 +305,6 @@ def ude_callstack(core: int = 0):
 def ude_eval(expr: str, core: int = 0):
     """Evaluate a UDE expression and return its current value."""
     return _call("eval", expr=expr, core=core)
-
-
-def _addr(a):
-    return int(a, 0) if isinstance(a, str) else a
 
 
 def main() -> None:
